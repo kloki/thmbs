@@ -2,6 +2,9 @@
 name = "thmbs"
 version = "0.1.0"
 edition = "2024"
+description = "ls(1) listing supplemented with inline image thumbnails"
+license = "MIT"
+repository = "https://github.com/kloki/thmbs"
 
 [[bin]]
 name = "thmbs"
@@ -15,4 +18,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
 
 [profile.release]
+lto = "thin"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
 lto = "thin"
