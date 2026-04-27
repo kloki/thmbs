@@ -21,86 +21,122 @@ const SIX_MONTHS: i64 = (365 * 86400) / 2;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "ill",
+    name = "thmbs",
     disable_help_flag = true,
     about = "ls(1) listing supplemented with image thumbnails and dimensions"
 )]
 struct Cli {
+    /// Print help
+    #[arg(long, action = clap::ArgAction::HelpLong)]
+    help: Option<bool>,
+
+    /// Thumbnail width in terminal cells
     #[arg(long, default_value_t = 3)]
     width: u32,
+    /// Thumbnail height in terminal cells
     #[arg(long, default_value_t = 1)]
     height: u32,
 
+    /// Preserve image aspect ratio when rendering thumbnails
     #[arg(long = "preserve-ratio", alias = "preserve_ratio",
           default_value_t = true,
           num_args = 0..=1, default_missing_value = "true",
           action = clap::ArgAction::Set)]
     preserve_ratio: bool,
+    /// Stretch thumbnails to fill width/height
     #[arg(long = "no-preserve-ratio", alias = "nopreserve_ratio",
           default_value_t = false, action = clap::ArgAction::SetTrue)]
     no_preserve_ratio: bool,
 
+    /// Show image dimensions (WxH) next to each file
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     dimensions: bool,
+    /// Hide image dimensions column
     #[arg(long = "no-dimensions", alias = "nodimensions",
           default_value_t = false, action = clap::ArgAction::SetTrue)]
     no_dimensions: bool,
 
+    /// Include files whose dimensions cannot be determined
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     unknown: bool,
+    /// Skip files whose dimensions cannot be determined
     #[arg(long = "no-unknown", alias = "nounknown",
           default_value_t = false, action = clap::ArgAction::SetTrue)]
     no_unknown: bool,
 
+    /// Reserved (currently unused)
     #[arg(long)]
     method: Option<String>,
 
     // ls options
+    /// List all entries except . and ..
     #[arg(short = 'A', action = clap::ArgAction::SetTrue)]
     a_upper: bool,
+    /// Append type indicator (*/=@|) to entries
     #[arg(short = 'F', action = clap::ArgAction::SetTrue)]
     f_upper: bool,
+    /// Recurse into subdirectories
     #[arg(short = 'R', action = clap::ArgAction::SetTrue)]
     r_upper: bool,
+    /// With -l, show complete time information
     #[arg(short = 'T', action = clap::ArgAction::SetTrue)]
     t_upper: bool,
+    /// List all entries including those starting with .
     #[arg(short = 'a', action = clap::ArgAction::SetTrue)]
     a: bool,
+    /// List directories themselves, not their contents
     #[arg(short = 'd', action = clap::ArgAction::SetTrue)]
     d: bool,
+    /// With -l, print sizes in human-readable format
     #[arg(short = 'h', action = clap::ArgAction::SetTrue)]
     h: bool,
+    /// Print each file's inode number
     #[arg(short = 'i', action = clap::ArgAction::SetTrue)]
     i: bool,
+    /// Display block counts in 1024-byte units
     #[arg(short = 'k', action = clap::ArgAction::SetTrue)]
     k: bool,
+    /// Use long listing format
     #[arg(short = 'l', action = clap::ArgAction::SetTrue)]
     l: bool,
+    /// Like -l, but show numeric UID/GID
     #[arg(short = 'n', action = clap::ArgAction::SetTrue)]
     n: bool,
+    /// Like -l, but omit group information
     #[arg(short = 'o', action = clap::ArgAction::SetTrue)]
     o: bool,
+    /// Append / to directory names
     #[arg(short = 'p', action = clap::ArgAction::SetTrue)]
     p: bool,
+    /// Reverse sort order
     #[arg(short = 'r', action = clap::ArgAction::SetTrue)]
     r: bool,
+    /// Print allocated block count for each file
     #[arg(short = 's', action = clap::ArgAction::SetTrue)]
     s: bool,
+    /// Sort by modification time, newest first
     #[arg(short = 't', action = clap::ArgAction::SetTrue)]
     t: bool,
+    /// Sort by file size, largest first
     #[arg(short = 'S', action = clap::ArgAction::SetTrue)]
     s_upper: bool,
+    /// Sort by/use access time instead of modification time
     #[arg(short = 'u', action = clap::ArgAction::SetTrue)]
     u: bool,
+    /// Use same sort order for ties as the primary sort
     #[arg(short = 'y', action = clap::ArgAction::SetTrue)]
     y: bool,
+    /// Sort by/use status change time (ctime)
     #[arg(short = 'c', action = clap::ArgAction::SetTrue)]
     c: bool,
+    /// Alias for -c
     #[arg(short = 'U', action = clap::ArgAction::SetTrue)]
     u_upper: bool,
+    /// strftime format for -l timestamps
     #[arg(short = 'D')]
     d_fmt: Option<String>,
 
+    /// Files or directories to list (default: current directory)
     paths: Vec<PathBuf>,
 }
 
@@ -677,7 +713,7 @@ fn main() {
             None => {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "ill: {}: No such file or directory",
+                    "thmbs: {}: No such file or directory",
                     p.display()
                 );
             }

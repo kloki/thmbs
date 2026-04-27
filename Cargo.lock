@@ -195,17 +195,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ill"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "clap",
- "imagesize",
- "libc",
-]
-
-[[package]]
 name = "imagesize"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -305,6 +294,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thmbs"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "clap",
+ "imagesize",
+ "libc",
 ]
 
 [[package]]
