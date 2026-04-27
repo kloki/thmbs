@@ -1,23 +1,43 @@
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::struct_excessive_bools,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    // Stylistic; not worth the churn across all write!/format! sites.
+    clippy::uninlined_format_args,
+    // Numeric literals in tests are clearer without separators here.
+    clippy::unreadable_literal,
+    // The single-match form mirrors adjacent multi-arm matches; keep symmetry.
+    clippy::single_match_else
+)]
+
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
+    ffi::CStr,
     fs,
-    io::{self, ErrorKind, Read as _, Write},
+    io::Write,
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use chrono::{DateTime, Local};
 use clap::Parser;
+use jiff::{Timestamp, Zoned, tz::TimeZone};
 
 const ONE_PIXEL_BLACK: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2NgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==";
 const SIX_MONTHS: i64 = (365 * 86400) / 2;
-const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,24 +69,24 @@ struct Cli {
     no_preserve_ratio: bool,
 
     /// Show image dimensions (WxH) next to each file
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue,
-          overrides_with = "no_dimensions")]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     dimensions: bool,
     /// Hide image dimensions column
     #[arg(long = "no-dimensions", alias = "nodimensions",
-          default_value_t = false, action = clap::ArgAction::SetTrue,
-          overrides_with = "dimensions")]
+          default_value_t = false, action = clap::ArgAction::SetTrue)]
     no_dimensions: bool,
 
     /// Include files whose dimensions cannot be determined
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue,
-          overrides_with = "no_unknown")]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     unknown: bool,
     /// Skip files whose dimensions cannot be determined
     #[arg(long = "no-unknown", alias = "nounknown",
-          default_value_t = false, action = clap::ArgAction::SetTrue,
-          overrides_with = "unknown")]
+          default_value_t = false, action = clap::ArgAction::SetTrue)]
     no_unknown: bool,
+
+    /// Reserved (currently unused)
+    #[arg(long)]
+    method: Option<String>,
 
     // ls options
     /// List all entries except . and ..
@@ -115,12 +135,10 @@ struct Cli {
     #[arg(short = 's', action = clap::ArgAction::SetTrue)]
     s: bool,
     /// Sort by modification time, newest first
-    #[arg(short = 't', action = clap::ArgAction::SetTrue,
-          overrides_with = "s_upper")]
+    #[arg(short = 't', action = clap::ArgAction::SetTrue)]
     t: bool,
     /// Sort by file size, largest first
-    #[arg(short = 'S', action = clap::ArgAction::SetTrue,
-          overrides_with = "t")]
+    #[arg(short = 'S', action = clap::ArgAction::SetTrue)]
     s_upper: bool,
     /// Sort by/use access time instead of modification time
     #[arg(short = 'u', action = clap::ArgAction::SetTrue)]
@@ -142,112 +160,76 @@ struct Cli {
     paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
-struct Opts {
-    img_width: u32,
-    img_height: u32,
-    preserve_ratio: bool,
+impl Cli {
+    fn show_dimensions(&self) -> bool {
+        // dimensions/no_dimensions: --no-X wins if set; otherwise --X.
+        // Per Perl: each toggles 'unknown' too.
+        let mut dimensions = self.dimensions;
+        if self.no_dimensions {
+            dimensions = false;
+        }
+        if self.unknown || self.no_unknown {
+            dimensions = !self.no_unknown || self.dimensions;
+        }
+        dimensions
+    }
 
-    dimensions: bool,
-    unknown: bool,
+    fn show_unknown(&self) -> bool {
+        let mut unknown = self.unknown;
+        if self.no_unknown {
+            unknown = false;
+        }
+        if self.dimensions || self.no_dimensions {
+            unknown = !self.no_dimensions || self.unknown;
+        }
+        unknown
+    }
 
-    a_upper: bool,
-    f_upper: bool,
-    r_upper: bool,
-    t_upper: bool,
-    a: bool,
-    d: bool,
-    h: bool,
-    i: bool,
-    k: bool,
-    l: bool,
-    n: bool,
-    o: bool,
-    p: bool,
-    r: bool,
-    s: bool,
-    t: bool,
-    s_upper: bool,
-    u: bool,
-    y: bool,
-    c: bool,
-    d_fmt: Option<String>,
-    show_blocks: bool,
-}
-
-impl Opts {
-    fn from_cli(c: Cli) -> (Self, Vec<PathBuf>) {
-        // With clap `overrides_with`, only one of each pair can be true at a time.
-        let dimensions = c.dimensions;
-        let unknown = c.unknown;
-        // Perl side-effect: setting either dimensions or unknown sets the other.
-        let (dimensions, unknown) = if c.dimensions || c.unknown {
-            (true, true)
-        } else if c.no_dimensions || c.no_unknown {
-            (false, false)
-        } else {
-            (dimensions, unknown)
-        };
-
-        let preserve_ratio = if c.no_preserve_ratio {
+    fn preserve_ratio_resolved(&self) -> bool {
+        if self.no_preserve_ratio {
             false
         } else {
-            c.preserve_ratio
-        };
-
-        let t = c.t;
-        let s_upper = c.s_upper;
-
-        let mut r_upper = c.r_upper;
-        if c.d {
-            r_upper = false;
+            self.preserve_ratio
         }
+    }
 
-        let mut t_upper = c.t_upper;
-        if c.d_fmt.is_some() {
-            t_upper = false;
+    fn sort_t(&self) -> bool {
+        self.t
+    }
+
+    fn sort_s_upper(&self) -> bool {
+        // Perl: -t deletes -S; if both set, prefer -t.
+        if self.t && self.s_upper {
+            return false;
         }
+        self.s_upper
+    }
 
-        let mut l = c.l;
-        if c.n || c.o {
-            l = true;
+    fn recurse(&self) -> bool {
+        if self.d {
+            return false;
         }
+        self.r_upper
+    }
 
-        let show_blocks = c.s;
+    fn t_upper_resolved(&self) -> bool {
+        if self.d_fmt.is_some() {
+            return false;
+        }
+        self.t_upper
+    }
 
-        // -c implies -U (per Perl alias 'c|U'); we collapse to c
-        let c_flag = c.c || c.u_upper;
+    fn long(&self) -> bool {
+        self.l || self.n || self.o
+    }
 
-        let opts = Opts {
-            img_width: c.width,
-            img_height: c.height,
-            preserve_ratio,
-            dimensions,
-            unknown,
-            a_upper: c.a_upper,
-            f_upper: c.f_upper,
-            r_upper,
-            t_upper,
-            a: c.a,
-            d: c.d,
-            h: c.h,
-            i: c.i,
-            k: c.k,
-            l,
-            n: c.n,
-            o: c.o,
-            p: c.p,
-            r: c.r,
-            s: c.s,
-            t,
-            s_upper,
-            u: c.u,
-            y: c.y,
-            c: c_flag,
-            d_fmt: c.d_fmt,
-            show_blocks,
-        };
-        (opts, c.paths)
+    fn show_blocks(&self) -> bool {
+        self.s
+    }
+
+    fn ctime(&self) -> bool {
+        // -c implies -U (per Perl alias 'c|U')
+        self.c || self.u_upper
     }
 }
 
@@ -267,101 +249,59 @@ fn lstat(path: &Path) -> Option<fs::Metadata> {
     })
 }
 
-/// Write bytes to `out`, replacing control bytes (< 0x20), DEL (0x7f),
-/// and ESC (0x1b) with `?`. Matches the spirit of `ls -q`.
-fn write_sanitized<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
-    let mut buf = [0u8; 256];
-    let mut n = 0;
-    for &b in bytes {
-        let ch = if b < 0x20 || b == 0x7f || b == 0x1b {
-            b'?'
-        } else {
-            b
-        };
-        buf[n] = ch;
-        n += 1;
-        if n == buf.len() {
-            out.write_all(&buf[..n])?;
-            n = 0;
-        }
-    }
-    if n > 0 {
-        out.write_all(&buf[..n])?;
-    }
-    Ok(())
-}
-
-fn read_capped(file: &Path) -> io::Result<Vec<u8>> {
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(file)?;
-    let md = f.metadata()?;
-    if !md.is_file() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    if md.len() > MAX_IMAGE_BYTES {
-        return Err(io::Error::new(ErrorKind::InvalidInput, "file too large"));
-    }
-    let mut buf = Vec::with_capacity(md.len() as usize);
-    f.take(MAX_IMAGE_BYTES).read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-fn write_image<W: Write>(out: &mut W, file: &Path, size: u64, opts: &Opts) -> io::Result<()> {
+fn write_image<W: Write>(out: &mut W, file: &Path, size: u64, cli: &Cli) {
     let display_name = file.as_os_str().as_bytes();
     let mut name_b64 = B64.encode(display_name);
     let mut size_str = size.to_string();
 
-    let encoded = if size > MAX_IMAGE_BYTES {
-        name_b64 = B64.encode(b"one_pixel_black");
-        size_str = ONE_PIXEL_BLACK.len().to_string();
-        ONE_PIXEL_BLACK.to_string()
-    } else {
-        match read_capped(file) {
-            Ok(bytes) if !bytes.is_empty() => B64.encode(&bytes),
-            _ => {
-                name_b64 = B64.encode(b"one_pixel_black");
-                size_str = ONE_PIXEL_BLACK.len().to_string();
-                ONE_PIXEL_BLACK.to_string()
-            }
+    let encoded = match fs::read(file) {
+        Ok(bytes) if !bytes.is_empty() => B64.encode(&bytes),
+        _ => {
+            name_b64 = B64.encode(b"one_pixel_black");
+            size_str = ONE_PIXEL_BLACK.len().to_string();
+            ONE_PIXEL_BLACK.to_string()
         }
     };
 
-    write!(
+    let _ = write!(
         out,
         "\x1b]1337;File=name={};size={};inline=1;height={};width={};preserveAspectRatio={}:{}\x07",
         name_b64,
         size_str,
-        opts.img_height,
-        opts.img_width,
-        if opts.preserve_ratio { "true" } else { "false" },
+        cli.height,
+        cli.width,
+        if cli.preserve_ratio_resolved() {
+            "true"
+        } else {
+            "false"
+        },
         encoded
-    )
+    );
 }
 
-fn write_placeholder<W: Write>(out: &mut W, opts: &Opts) -> io::Result<()> {
+fn write_placeholder<W: Write>(out: &mut W, cli: &Cli) {
     let name_b64 = B64.encode(b"one_pixel_black");
-    write!(
+    let _ = write!(
         out,
         "\x1b]1337;File=name={};size={};inline=1;height={};width={};preserveAspectRatio={}:{}\x07",
         name_b64,
         ONE_PIXEL_BLACK.len(),
-        opts.img_height,
-        opts.img_width,
-        if opts.preserve_ratio { "true" } else { "false" },
+        cli.height,
+        cli.width,
+        if cli.preserve_ratio_resolved() {
+            "true"
+        } else {
+            "false"
+        },
         ONE_PIXEL_BLACK
-    )
+    );
 }
 
 fn get_dimensions(path: &Path) -> Option<(usize, usize)> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
-        .map(|s| s.to_lowercase());
+        .map(str::to_lowercase);
     if let Some(ref e) = ext {
         let skip = FAILED_TYPES.with(|f| f.borrow().contains(e));
         if skip {
@@ -381,12 +321,12 @@ fn get_dimensions(path: &Path) -> Option<(usize, usize)> {
     }
 }
 
-fn ls_sort(paths: &mut [PathBuf], opts: &Opts) {
-    let samesort = opts.y || std::env::var("LS_SAMESORT").is_ok();
-    if opts.t {
+fn ls_sort(paths: &mut [PathBuf], cli: &Cli) {
+    let samesort = cli.y || std::env::var("LS_SAMESORT").is_ok();
+    if cli.sort_t() {
         paths.sort_by(|a, b| {
-            let am = lstat(a).map(|m| m.mtime()).unwrap_or(0);
-            let bm = lstat(b).map(|m| m.mtime()).unwrap_or(0);
+            let am = lstat(a).map_or(0, |m| m.mtime());
+            let bm = lstat(b).map_or(0, |m| m.mtime());
             match bm.cmp(&am) {
                 Ordering::Equal => {
                     if samesort {
@@ -398,18 +338,18 @@ fn ls_sort(paths: &mut [PathBuf], opts: &Opts) {
                 o => o,
             }
         });
-    } else if opts.c {
+    } else if cli.ctime() {
         paths.sort();
-    } else if opts.u {
+    } else if cli.u {
         paths.sort_by(|a, b| {
-            let am = lstat(a).map(|m| m.atime()).unwrap_or(0);
-            let bm = lstat(b).map(|m| m.atime()).unwrap_or(0);
+            let am = lstat(a).map_or(0, |m| m.atime());
+            let bm = lstat(b).map_or(0, |m| m.atime());
             am.cmp(&bm)
         });
-    } else if opts.s_upper {
+    } else if cli.sort_s_upper() {
         paths.sort_by(|a, b| {
-            let asz = lstat(a).map(|m| m.size()).unwrap_or(0);
-            let bsz = lstat(b).map(|m| m.size()).unwrap_or(0);
+            let asz = lstat(a).map_or(0, |m| m.size());
+            let bsz = lstat(b).map_or(0, |m| m.size());
             match bsz.cmp(&asz) {
                 Ordering::Equal => a.cmp(b),
                 o => o,
@@ -418,7 +358,7 @@ fn ls_sort(paths: &mut [PathBuf], opts: &Opts) {
     } else {
         paths.sort();
     }
-    if opts.r {
+    if cli.r {
         paths.reverse();
     }
 }
@@ -453,53 +393,76 @@ fn format_mode(mode: u32) -> String {
 }
 
 fn format_human(bytes: u64) -> String {
-    let units = ["B", "K", "M", "G", "T", "P"];
-    let s = bytes.to_string();
-    let scale = (s.len().saturating_sub(1)) / 3;
-    let scale = scale.min(units.len() - 1);
-    let float = bytes as f64 / 1024_f64.powi(scale as i32);
-    let int_part = float.trunc() as u64;
-    let int_len = int_part.to_string().len();
-    if s.len() < 3 || int_len >= 2 {
-        let frac = float - int_part as f64;
-        let rounded = if frac < 0.5 { int_part } else { int_part + 1 };
-        format!("{}{}", rounded, units[scale])
+    const UNITS: &[&str] = &["B", "K", "M", "G", "T", "P"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{}B", bytes)
+    } else if v >= 10.0 {
+        format!("{:.0}{}", v, UNITS[i])
     } else {
-        format!("{:.1}{}", float, units[scale])
+        format!("{:.1}{}", v, UNITS[i])
     }
 }
 
-fn format_time(time: i64, opts: &Opts) -> String {
-    let dt: DateTime<Local> = DateTime::from_timestamp(time, 0)
-        .map(|t| t.with_timezone(&Local))
-        .unwrap_or_else(Local::now);
-    let now = Local::now().timestamp();
-    let fmt: &str = if let Some(f) = &opts.d_fmt {
+fn zoned_from_unix(time: i64) -> Zoned {
+    let ts = Timestamp::from_second(time).unwrap_or_else(|_| Timestamp::now());
+    ts.to_zoned(TimeZone::system())
+}
+
+fn format_time(time: i64, cli: &Cli) -> String {
+    let dt = zoned_from_unix(time);
+    let now = Zoned::now().timestamp().as_second();
+    let fmt: &str = if let Some(f) = &cli.d_fmt {
         f.as_str()
-    } else if opts.t_upper {
+    } else if cli.t_upper_resolved() {
         "%b %e %H:%M:%S %Y"
     } else if time + SIX_MONTHS > now && time < now + SIX_MONTHS {
         "%b %e %H:%M"
     } else {
         "%b %e  %Y"
     };
-    dt.format(fmt).to_string()
+    dt.strftime(fmt).to_string()
 }
 
 fn uid_name(uid: u32) -> Option<String> {
-    uzers::get_user_by_uid(uid).and_then(|u| u.name().to_str().map(String::from))
+    unsafe {
+        let pw = libc::getpwuid(uid as libc::uid_t);
+        if pw.is_null() {
+            return None;
+        }
+        let n = (*pw).pw_name;
+        if n.is_null() {
+            return None;
+        }
+        CStr::from_ptr(n).to_str().ok().map(ToString::to_string)
+    }
 }
 
 fn gid_name(gid: u32) -> Option<String> {
-    uzers::get_group_by_gid(gid).and_then(|g| g.name().to_str().map(String::from))
+    unsafe {
+        let gr = libc::getgrgid(gid as libc::gid_t);
+        if gr.is_null() {
+            return None;
+        }
+        let n = (*gr).gr_name;
+        if n.is_null() {
+            return None;
+        }
+        CStr::from_ptr(n).to_str().ok().map(ToString::to_string)
+    }
 }
 
-fn get_f_type(md: &fs::Metadata, opts: &Opts) -> &'static str {
+fn get_f_type(md: &fs::Metadata, cli: &Cli) -> &'static str {
     let ft = md.file_type();
-    if ft.is_dir() && (opts.p || opts.f_upper) {
+    if ft.is_dir() && (cli.p || cli.f_upper) {
         return "/";
     }
-    if !opts.f_upper {
+    if !cli.f_upper {
         return "";
     }
     if ft.is_symlink() {
@@ -523,36 +486,34 @@ struct Entry {
     dims: Option<(usize, usize)>,
 }
 
-/// Returns the bytes used as the displayed filename for `path`.
-/// When `parent` is set, returns just the file name; otherwise the full path.
-fn entry_filename_bytes(path: &Path, parent: Option<&Path>) -> Vec<u8> {
+fn entry_filename(path: &Path, parent: Option<&Path>) -> String {
     if parent.is_some() {
         path.file_name()
-            .map(|s| s.as_bytes().to_vec())
+            .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     } else {
-        path.as_os_str().as_bytes().to_vec()
+        path.to_string_lossy().into_owned()
     }
 }
 
-fn dot_filtered(name: &str, opts: &Opts) -> bool {
-    if opts.a {
+fn dot_filtered(name: &str, cli: &Cli) -> bool {
+    if cli.a {
         return false;
     }
-    if opts.a_upper {
+    if cli.a_upper {
         return name == "." || name == "..";
     }
     name.starts_with('.')
 }
 
-fn read_dir_split(path: &Path, opts: &Opts) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+fn read_dir_split(path: &Path, cli: &Cli) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if dot_filtered(&name_str, opts) {
+        if dot_filtered(&name_str, cli) {
             continue;
         }
         let p = entry.path();
@@ -570,35 +531,31 @@ fn read_dir_split(path: &Path, opts: &Opts) -> io::Result<(Vec<PathBuf>, Vec<Pat
     Ok((files, dirs))
 }
 
-fn do_ls<W: Write>(
-    out: &mut W,
-    parent: Option<&Path>,
-    mut paths: Vec<PathBuf>,
-    opts: &Opts,
-) -> io::Result<()> {
-    ls_sort(&mut paths, opts);
+fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, cli: &Cli) {
+    ls_sort(&mut paths, cli);
+
+    let show_dims = cli.show_dimensions();
+    let show_unknown = cli.show_unknown();
+    let long = cli.long();
+    let show_blocks = cli.show_blocks();
 
     let mut entries: Vec<Entry> = Vec::with_capacity(paths.len());
     let mut blocks_total: u64 = 0;
 
-    for p in paths.into_iter() {
-        let md = match lstat(&p) {
-            Some(m) => m,
-            None => continue,
+    for p in paths {
+        let Some(md) = lstat(&p) else {
+            continue;
         };
-        let dims = if opts.dimensions && md.file_type().is_file() && md.len() > 0 {
+        let dims = if show_dims && md.file_type().is_file() && md.len() > 0 {
             get_dimensions(&p)
         } else {
             None
         };
 
-        if opts.show_blocks || opts.l {
-            let name_bytes = entry_filename_bytes(&p, parent);
-            let is_hidden_dotfile = name_bytes.starts_with(b".")
-                && !name_bytes.starts_with(b"..")
-                && name_bytes.as_slice() != b".";
-            // Perl: if not -d and ($opts{a} or filename !~ /^\.[^.]+/)
-            if !md.file_type().is_dir() && (opts.a || !is_hidden_dotfile) {
+        if show_blocks || long {
+            let name = entry_filename(&p, parent);
+            let is_hidden_dotfile = name.starts_with('.') && !name.starts_with("..") && name != ".";
+            if !md.file_type().is_dir() && (cli.a || !is_hidden_dotfile) {
                 blocks_total += md.blocks();
             }
         }
@@ -620,23 +577,23 @@ fn do_ls<W: Write>(
             w_dim_w = w_dim_w.max(w.to_string().len());
             w_dim_h = w_dim_h.max(h.to_string().len());
         }
-        if opts.show_blocks || opts.l {
+        if show_blocks || long {
             w_blocks = w_blocks.max(e.md.blocks().to_string().len());
             w_nlink = w_nlink.max(e.md.nlink().to_string().len());
         }
-        if opts.i {
+        if cli.i {
             w_ino = w_ino.max(e.md.ino().to_string().len());
         }
-        if opts.l {
+        if long {
             w_bytes = w_bytes.max(e.md.len().to_string().len());
-            let owner = if opts.n {
+            let owner = if cli.n {
                 e.md.uid().to_string()
             } else {
                 uid_name(e.md.uid()).unwrap_or_else(|| e.md.uid().to_string())
             };
             w_owner = w_owner.max(owner.len());
-            if !opts.o {
-                let group = if opts.n {
+            if !cli.o {
+                let group = if cli.n {
                     e.md.gid().to_string()
                 } else {
                     gid_name(e.md.gid()).unwrap_or_else(|| e.md.gid().to_string())
@@ -646,86 +603,84 @@ fn do_ls<W: Write>(
         }
     }
 
-    if (opts.show_blocks || opts.l) && parent.is_some() && !opts.d {
-        let total = if opts.k {
+    if (show_blocks || long) && parent.is_some() && !cli.d {
+        let total = if cli.k {
             blocks_total / 2
         } else {
             blocks_total
         };
-        writeln!(out, "total {}", total)?;
+        let _ = writeln!(out, "total {}", total);
     }
 
     for e in &entries {
         let placeholder = !e.md.file_type().is_file()
             || e.md.len() == 0
-            || (opts.dimensions && e.dims.is_none() && !opts.unknown);
+            || (show_dims && e.dims.is_none() && !show_unknown);
         if placeholder {
-            write_placeholder(out, opts)?;
+            write_placeholder(out, cli);
         } else {
-            write_image(out, &e.path, e.md.len(), opts)?;
+            write_image(out, &e.path, e.md.len(), cli);
         }
 
-        if opts.dimensions && (w_dim_w > 0 || w_dim_h > 0) {
+        if show_dims && (w_dim_w > 0 || w_dim_h > 0) {
             let mw = w_dim_w.max(1);
             let mh = w_dim_h.max(1);
             if let Some((w, h)) = e.dims {
-                write!(out, " [{:>mw$} x {:>mh$}] ", w, h, mw = mw, mh = mh)?;
+                let _ = write!(out, " [{:>mw$} x {:>mh$}] ", w, h, mw = mw, mh = mh);
             } else {
-                write!(out, " {:>mw$}   {:>mh$}   ", "", "", mw = mw, mh = mh)?;
+                let _ = write!(out, " {:>mw$}   {:>mh$}   ", "", "", mw = mw, mh = mh);
             }
         }
 
-        if opts.i {
-            write!(out, " {:>w$}", e.md.ino(), w = w_ino)?;
+        if cli.i {
+            let _ = write!(out, " {:>w$}", e.md.ino(), w = w_ino);
         }
-        if opts.s {
-            write!(out, " {:>w$}", e.md.blocks(), w = w_blocks)?;
+        if cli.s {
+            let _ = write!(out, " {:>w$}", e.md.blocks(), w = w_blocks);
         }
-        if opts.l {
-            write!(out, " {}", format_mode(e.md.mode()))?;
-            write!(out, " {:>w$}", e.md.nlink(), w = w_nlink)?;
-            let owner = if opts.n {
+        if long {
+            let _ = write!(out, " {}", format_mode(e.md.mode()));
+            let _ = write!(out, " {:>w$}", e.md.nlink(), w = w_nlink);
+            let owner = if cli.n {
                 e.md.uid().to_string()
             } else {
                 uid_name(e.md.uid()).unwrap_or_else(|| e.md.uid().to_string())
             };
-            write!(out, " {:>w$}", owner, w = w_owner)?;
-            if !opts.o {
-                let group = if opts.n {
+            let _ = write!(out, " {:>w$}", owner, w = w_owner);
+            if !cli.o {
+                let group = if cli.n {
                     e.md.gid().to_string()
                 } else {
                     gid_name(e.md.gid()).unwrap_or_else(|| e.md.gid().to_string())
                 };
-                write!(out, "  {:>w$}", group, w = w_group)?;
+                let _ = write!(out, "  {:>w$}", group, w = w_group);
             }
-            if opts.h {
-                write!(out, "  {:>4}", format_human(e.md.len()))?;
+            if cli.h {
+                let _ = write!(out, "  {:>4}", format_human(e.md.len()));
             } else {
-                write!(out, "  {:>w$}", e.md.len(), w = w_bytes)?;
+                let _ = write!(out, "  {:>w$}", e.md.len(), w = w_bytes);
             }
-            let t = if opts.c { e.md.ctime() } else { e.md.mtime() };
-            write!(out, " {}", format_time(t, opts))?;
+            let t = if cli.ctime() {
+                e.md.ctime()
+            } else {
+                e.md.mtime()
+            };
+            let _ = write!(out, " {}", format_time(t, cli));
         }
 
-        let name = entry_filename_bytes(&e.path, parent);
-        out.write_all(b" ")?;
-        write_sanitized(out, &name)?;
-        let suffix = get_f_type(&e.md, opts);
-        write!(out, "{}", suffix)?;
-        writeln!(out)?;
+        let name = entry_filename(&e.path, parent);
+        let _ = write!(out, " {}", name);
+        let suffix = get_f_type(&e.md, cli);
+        let _ = write!(out, "{}", suffix);
+        let _ = writeln!(out);
     }
-
-    // Bound the stat cache: clear at end of each directory listing.
-    STAT_CACHE.with(|c| c.borrow_mut().clear());
-
-    Ok(())
 }
 
-fn run() -> io::Result<()> {
+fn main() {
     let cli = Cli::parse();
-    let (opts, mut paths) = Opts::from_cli(cli);
+    let mut paths = cli.paths.clone();
 
-    let stdout = io::stdout();
+    let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
     let mut do_header = paths.len() > 1;
@@ -734,81 +689,65 @@ fn run() -> io::Result<()> {
     }
 
     let mut files: Vec<PathBuf> = Vec::new();
-    let mut dirs: VecDeque<PathBuf> = VecDeque::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
     for p in paths {
         match lstat(&p) {
             None => {
-                writeln!(
-                    io::stderr(),
+                let _ = writeln!(
+                    std::io::stderr(),
                     "thmbs: {}: No such file or directory",
                     p.display()
-                )?;
+                );
             }
-            Some(md) if md.file_type().is_file() || (opts.d && !md.file_type().is_dir()) => {
+            Some(md) if md.file_type().is_file() || (cli.d && !md.file_type().is_dir()) => {
                 files.push(p);
             }
             Some(md) if md.file_type().is_dir() => {
-                if opts.d {
+                if cli.d {
                     files.push(p);
                 } else {
-                    dirs.push_back(p);
+                    dirs.push(p);
                 }
             }
             Some(_) => files.push(p),
         }
     }
 
-    ls_sort(&mut files, &opts);
-    {
-        let mut tmp: Vec<PathBuf> = dirs.drain(..).collect();
-        ls_sort(&mut tmp, &opts);
-        dirs = VecDeque::from(tmp);
-    }
+    ls_sort(&mut files, &cli);
+    ls_sort(&mut dirs, &cli);
 
     if !files.is_empty() {
-        do_ls(&mut out, None, files, &opts)?;
-    }
-
-    // Symlink-loop guard for -R: track visited (dev, ino).
-    let mut visited: HashSet<(u64, u64)> = HashSet::new();
-    // Seed visited with initially-listed dirs so we never re-enter them.
-    for d in &dirs {
-        if let Some(md) = lstat(d) {
-            visited.insert((md.dev(), md.ino()));
-        }
+        do_ls(&mut out, None, files, &cli);
     }
 
     let mut do_newline = false;
-    while let Some(path) = dirs.pop_front() {
-        let (f, d) = match read_dir_split(&path, &opts) {
+    while !dirs.is_empty() {
+        let path = dirs.remove(0);
+        let (f, d) = match read_dir_split(&path, &cli) {
             Ok(t) => t,
             Err(e) => {
-                writeln!(
-                    io::stderr(),
+                let _ = writeln!(
+                    std::io::stderr(),
                     "Unable to open directory {}: {}",
                     path.display(),
                     e
-                )?;
+                );
                 continue;
             }
         };
         if do_newline {
-            writeln!(out)?;
+            let _ = writeln!(out);
         }
         if do_header {
-            write!(out, "")?;
-            // Sanitize the directory header path bytes.
-            let header = path.as_os_str().as_bytes();
-            write_sanitized(&mut out, header)?;
-            writeln!(out, ":")?;
+            let _ = writeln!(out, "{}:", path.display());
         }
         do_header = true;
 
         let mut combined = f;
         combined.extend(d.iter().cloned());
-        do_ls(&mut out, Some(&path), combined, &opts)?;
+        do_ls(&mut out, Some(&path), combined, &cli);
 
-        if opts.r_upper {
+        if cli.recurse() {
             for sub in d {
                 let name = sub
                     .file_name()
@@ -817,30 +756,162 @@ fn run() -> io::Result<()> {
                 if name == "." || name == ".." {
                     continue;
                 }
-                if let Some(md) = lstat(&sub) {
-                    let key = (md.dev(), md.ino());
-                    if visited.insert(key) {
-                        dirs.push_back(sub);
-                    }
-                }
+                dirs.push(sub);
             }
         }
         do_newline = true;
     }
-
-    out.flush()?;
-    Ok(())
 }
 
-fn main() {
-    match run() {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::BrokenPipe => {
-            std::process::exit(0);
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn default_cli() -> Cli {
+        Cli {
+            help: None,
+            width: 3,
+            height: 1,
+            preserve_ratio: true,
+            no_preserve_ratio: false,
+            dimensions: false,
+            no_dimensions: false,
+            unknown: false,
+            no_unknown: false,
+            method: None,
+            a_upper: false,
+            f_upper: false,
+            r_upper: false,
+            t_upper: false,
+            a: false,
+            d: false,
+            h: false,
+            i: false,
+            k: false,
+            l: false,
+            n: false,
+            o: false,
+            p: false,
+            r: false,
+            s: false,
+            t: false,
+            s_upper: false,
+            u: false,
+            y: false,
+            c: false,
+            u_upper: false,
+            d_fmt: None,
+            paths: vec![],
         }
-        Err(e) => {
-            let _ = writeln!(io::stderr(), "thmbs: {}", e);
-            std::process::exit(1);
-        }
+    }
+
+    #[test]
+    fn format_human_boundaries() {
+        assert_eq!(format_human(0), "0B");
+        assert_eq!(format_human(1), "1B");
+        assert_eq!(format_human(1023), "1023B");
+        assert_eq!(format_human(1024), "1.0K");
+        assert_eq!(format_human(1536), "1.5K");
+        assert_eq!(format_human(10 * 1024), "10K");
+        assert_eq!(format_human(1024 * 1024 - 1), "1024K");
+        assert_eq!(format_human(1024 * 1024), "1.0M");
+    }
+
+    #[test]
+    fn format_mode_regular_file() {
+        // 0o100644 = regular file, rw-r--r--
+        assert_eq!(format_mode(0o100644), "-rw-r--r--");
+    }
+
+    #[test]
+    fn format_mode_directory() {
+        // 0o040755 = directory, rwxr-xr-x
+        assert_eq!(format_mode(0o040755), "drwxr-xr-x");
+    }
+
+    #[test]
+    fn format_mode_symlink() {
+        // 0o120777 = symlink
+        assert_eq!(format_mode(0o120777), "lrwxrwxrwx");
+    }
+
+    #[test]
+    fn format_mode_setuid() {
+        // 0o104755 = regular file with setuid, rwsr-xr-x
+        assert_eq!(format_mode(0o104755), "-rwsr-xr-x");
+    }
+
+    #[test]
+    fn format_mode_setuid_no_x() {
+        // 0o104644 = setuid without owner-x, rwSr--r--
+        assert_eq!(format_mode(0o104644), "-rwSr--r--");
+    }
+
+    #[test]
+    fn format_mode_sticky() {
+        // 0o041777 = directory, sticky, rwxrwxrwt
+        assert_eq!(format_mode(0o041777), "drwxrwxrwt");
+    }
+
+    #[test]
+    fn format_mode_setgid() {
+        // 0o102755 = setgid file: rwxr-sr-x
+        assert_eq!(format_mode(0o102755), "-rwxr-sr-x");
+    }
+
+    #[test]
+    fn format_time_known_epoch() {
+        // For a fixed timestamp, just check that it produces non-empty output
+        // and that the d_fmt override works.
+        let mut cli = default_cli();
+        cli.d_fmt = Some("%Y-%m-%d".to_string());
+        // Use a SystemTime to derive seconds, demonstrating use of the import.
+        let st = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let secs = st.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let s = format_time(secs, &cli);
+        // 2023-11-14 in UTC; locally may shift one day either way, just check format shape
+        assert_eq!(s.len(), 10);
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+    }
+
+    #[test]
+    fn format_time_t_upper_format() {
+        let mut cli = default_cli();
+        cli.t_upper = true;
+        let s = format_time(0, &cli);
+        // "%b %e %H:%M:%S %Y" -> ends with year (4 digits)
+        let year: i32 = s[s.len() - 4..].parse().unwrap();
+        assert!((1969..=1970).contains(&year));
+    }
+
+    #[test]
+    fn dot_filtered_default() {
+        let cli = default_cli();
+        assert!(dot_filtered(".foo", &cli));
+        assert!(dot_filtered("..", &cli));
+        assert!(!dot_filtered("foo", &cli));
+    }
+
+    #[test]
+    fn dot_filtered_a() {
+        let mut cli = default_cli();
+        cli.a = true;
+        assert!(!dot_filtered(".foo", &cli));
+        assert!(!dot_filtered("..", &cli));
+        assert!(!dot_filtered("foo", &cli));
+    }
+
+    #[test]
+    fn dot_filtered_a_upper() {
+        let mut cli = default_cli();
+        cli.a_upper = true;
+        // -A: keep .foo, drop . and ..
+        assert!(!dot_filtered(".foo", &cli));
+        assert!(dot_filtered(".", &cli));
+        assert!(dot_filtered("..", &cli));
+        assert!(!dot_filtered("foo", &cli));
     }
 }

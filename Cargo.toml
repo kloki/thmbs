@@ -14,9 +14,8 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 imagesize = "0.13"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+jiff = "0.2"
 libc = "0.2"
-uzers = "0.12"
 
 [profile.release]
 lto = "thin"
@@ -25,3 +24,6 @@ lto = "thin"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
