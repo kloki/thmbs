@@ -16,6 +16,7 @@ base64 = "0.22"
 imagesize = "0.13"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
+uzers = "0.12"
 
 [profile.release]
 lto = "thin"

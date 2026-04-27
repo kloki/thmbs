@@ -1,13 +1,12 @@
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{HashMap, HashSet},
-    ffi::CStr,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::Write,
+    io::{self, ErrorKind, Read as _, Write},
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -18,6 +17,7 @@ use clap::Parser;
 
 const ONE_PIXEL_BLACK: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2NgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==";
 const SIX_MONTHS: i64 = (365 * 86400) / 2;
+const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,24 +49,24 @@ struct Cli {
     no_preserve_ratio: bool,
 
     /// Show image dimensions (WxH) next to each file
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "no_dimensions")]
     dimensions: bool,
     /// Hide image dimensions column
     #[arg(long = "no-dimensions", alias = "nodimensions",
-          default_value_t = false, action = clap::ArgAction::SetTrue)]
+          default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "dimensions")]
     no_dimensions: bool,
 
     /// Include files whose dimensions cannot be determined
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "no_unknown")]
     unknown: bool,
     /// Skip files whose dimensions cannot be determined
     #[arg(long = "no-unknown", alias = "nounknown",
-          default_value_t = false, action = clap::ArgAction::SetTrue)]
+          default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "unknown")]
     no_unknown: bool,
-
-    /// Reserved (currently unused)
-    #[arg(long)]
-    method: Option<String>,
 
     // ls options
     /// List all entries except . and ..
@@ -115,10 +115,12 @@ struct Cli {
     #[arg(short = 's', action = clap::ArgAction::SetTrue)]
     s: bool,
     /// Sort by modification time, newest first
-    #[arg(short = 't', action = clap::ArgAction::SetTrue)]
+    #[arg(short = 't', action = clap::ArgAction::SetTrue,
+          overrides_with = "s_upper")]
     t: bool,
     /// Sort by file size, largest first
-    #[arg(short = 'S', action = clap::ArgAction::SetTrue)]
+    #[arg(short = 'S', action = clap::ArgAction::SetTrue,
+          overrides_with = "t")]
     s_upper: bool,
     /// Sort by/use access time instead of modification time
     #[arg(short = 'u', action = clap::ArgAction::SetTrue)]
@@ -175,23 +177,17 @@ struct Opts {
 
 impl Opts {
     fn from_cli(c: Cli) -> (Self, Vec<PathBuf>) {
-        // dimensions/no_dimensions: --no-X wins if set; otherwise --X.
-        // Per Perl: each toggles 'unknown' too.
-        let mut dimensions = c.dimensions;
-        if c.no_dimensions {
-            dimensions = false;
-        }
-        let mut unknown = c.unknown;
-        if c.no_unknown {
-            unknown = false;
-        }
+        // With clap `overrides_with`, only one of each pair can be true at a time.
+        let dimensions = c.dimensions;
+        let unknown = c.unknown;
         // Perl side-effect: setting either dimensions or unknown sets the other.
-        if c.dimensions || c.no_dimensions {
-            unknown = !c.no_dimensions || c.unknown;
-        }
-        if c.unknown || c.no_unknown {
-            dimensions = !c.no_unknown || c.dimensions;
-        }
+        let (dimensions, unknown) = if c.dimensions || c.unknown {
+            (true, true)
+        } else if c.no_dimensions || c.no_unknown {
+            (false, false)
+        } else {
+            (dimensions, unknown)
+        };
 
         let preserve_ratio = if c.no_preserve_ratio {
             false
@@ -200,11 +196,7 @@ impl Opts {
         };
 
         let t = c.t;
-        let mut s_upper = c.s_upper;
-        // Perl: -t deletes -S, -S deletes -t. Last one wins via clap; both true => prefer -t (unspecified, match Perl: each clears the other when seen — final state depends on order, which clap doesn't track; pick: if both set, keep -t).
-        if t && s_upper {
-            s_upper = false;
-        }
+        let s_upper = c.s_upper;
 
         let mut r_upper = c.r_upper;
         if c.d {
@@ -275,21 +267,71 @@ fn lstat(path: &Path) -> Option<fs::Metadata> {
     })
 }
 
-fn write_image<W: Write>(out: &mut W, file: &Path, size: u64, opts: &Opts) {
+/// Write bytes to `out`, replacing control bytes (< 0x20), DEL (0x7f),
+/// and ESC (0x1b) with `?`. Matches the spirit of `ls -q`.
+fn write_sanitized<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
+    let mut buf = [0u8; 256];
+    let mut n = 0;
+    for &b in bytes {
+        let ch = if b < 0x20 || b == 0x7f || b == 0x1b {
+            b'?'
+        } else {
+            b
+        };
+        buf[n] = ch;
+        n += 1;
+        if n == buf.len() {
+            out.write_all(&buf[..n])?;
+            n = 0;
+        }
+    }
+    if n > 0 {
+        out.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+fn read_capped(file: &Path) -> io::Result<Vec<u8>> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)?;
+    let md = f.metadata()?;
+    if !md.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if md.len() > MAX_IMAGE_BYTES {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "file too large"));
+    }
+    let mut buf = Vec::with_capacity(md.len() as usize);
+    f.take(MAX_IMAGE_BYTES).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_image<W: Write>(out: &mut W, file: &Path, size: u64, opts: &Opts) -> io::Result<()> {
     let display_name = file.as_os_str().as_bytes();
     let mut name_b64 = B64.encode(display_name);
     let mut size_str = size.to_string();
 
-    let encoded = match fs::read(file) {
-        Ok(bytes) if !bytes.is_empty() => B64.encode(&bytes),
-        _ => {
-            name_b64 = B64.encode(b"one_pixel_black");
-            size_str = ONE_PIXEL_BLACK.len().to_string();
-            ONE_PIXEL_BLACK.to_string()
+    let encoded = if size > MAX_IMAGE_BYTES {
+        name_b64 = B64.encode(b"one_pixel_black");
+        size_str = ONE_PIXEL_BLACK.len().to_string();
+        ONE_PIXEL_BLACK.to_string()
+    } else {
+        match read_capped(file) {
+            Ok(bytes) if !bytes.is_empty() => B64.encode(&bytes),
+            _ => {
+                name_b64 = B64.encode(b"one_pixel_black");
+                size_str = ONE_PIXEL_BLACK.len().to_string();
+                ONE_PIXEL_BLACK.to_string()
+            }
         }
     };
 
-    let _ = write!(
+    write!(
         out,
         "\x1b]1337;File=name={};size={};inline=1;height={};width={};preserveAspectRatio={}:{}\x07",
         name_b64,
@@ -298,12 +340,12 @@ fn write_image<W: Write>(out: &mut W, file: &Path, size: u64, opts: &Opts) {
         opts.img_width,
         if opts.preserve_ratio { "true" } else { "false" },
         encoded
-    );
+    )
 }
 
-fn write_placeholder<W: Write>(out: &mut W, opts: &Opts) {
+fn write_placeholder<W: Write>(out: &mut W, opts: &Opts) -> io::Result<()> {
     let name_b64 = B64.encode(b"one_pixel_black");
-    let _ = write!(
+    write!(
         out,
         "\x1b]1337;File=name={};size={};inline=1;height={};width={};preserveAspectRatio={}:{}\x07",
         name_b64,
@@ -312,7 +354,7 @@ fn write_placeholder<W: Write>(out: &mut W, opts: &Opts) {
         opts.img_width,
         if opts.preserve_ratio { "true" } else { "false" },
         ONE_PIXEL_BLACK
-    );
+    )
 }
 
 fn get_dimensions(path: &Path) -> Option<(usize, usize)> {
@@ -339,7 +381,7 @@ fn get_dimensions(path: &Path) -> Option<(usize, usize)> {
     }
 }
 
-fn ls_sort(paths: &mut Vec<PathBuf>, opts: &Opts) {
+fn ls_sort(paths: &mut [PathBuf], opts: &Opts) {
     let samesort = opts.y || std::env::var("LS_SAMESORT").is_ok();
     if opts.t {
         paths.sort_by(|a, b| {
@@ -445,31 +487,11 @@ fn format_time(time: i64, opts: &Opts) -> String {
 }
 
 fn uid_name(uid: u32) -> Option<String> {
-    unsafe {
-        let pw = libc::getpwuid(uid as libc::uid_t);
-        if pw.is_null() {
-            return None;
-        }
-        let n = (*pw).pw_name;
-        if n.is_null() {
-            return None;
-        }
-        CStr::from_ptr(n).to_str().ok().map(|s| s.to_string())
-    }
+    uzers::get_user_by_uid(uid).and_then(|u| u.name().to_str().map(String::from))
 }
 
 fn gid_name(gid: u32) -> Option<String> {
-    unsafe {
-        let gr = libc::getgrgid(gid as libc::gid_t);
-        if gr.is_null() {
-            return None;
-        }
-        let n = (*gr).gr_name;
-        if n.is_null() {
-            return None;
-        }
-        CStr::from_ptr(n).to_str().ok().map(|s| s.to_string())
-    }
+    uzers::get_group_by_gid(gid).and_then(|g| g.name().to_str().map(String::from))
 }
 
 fn get_f_type(md: &fs::Metadata, opts: &Opts) -> &'static str {
@@ -501,13 +523,15 @@ struct Entry {
     dims: Option<(usize, usize)>,
 }
 
-fn entry_filename(path: &Path, parent: Option<&Path>) -> String {
+/// Returns the bytes used as the displayed filename for `path`.
+/// When `parent` is set, returns just the file name; otherwise the full path.
+fn entry_filename_bytes(path: &Path, parent: Option<&Path>) -> Vec<u8> {
     if parent.is_some() {
         path.file_name()
-            .map(|s| s.to_string_lossy().into_owned())
+            .map(|s| s.as_bytes().to_vec())
             .unwrap_or_default()
     } else {
-        path.to_string_lossy().into_owned()
+        path.as_os_str().as_bytes().to_vec()
     }
 }
 
@@ -521,7 +545,7 @@ fn dot_filtered(name: &str, opts: &Opts) -> bool {
     name.starts_with('.')
 }
 
-fn read_dir_split(path: &Path, opts: &Opts) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+fn read_dir_split(path: &Path, opts: &Opts) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
     for entry in fs::read_dir(path)? {
@@ -546,7 +570,12 @@ fn read_dir_split(path: &Path, opts: &Opts) -> std::io::Result<(Vec<PathBuf>, Ve
     Ok((files, dirs))
 }
 
-fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, opts: &Opts) {
+fn do_ls<W: Write>(
+    out: &mut W,
+    parent: Option<&Path>,
+    mut paths: Vec<PathBuf>,
+    opts: &Opts,
+) -> io::Result<()> {
     ls_sort(&mut paths, opts);
 
     let mut entries: Vec<Entry> = Vec::with_capacity(paths.len());
@@ -564,8 +593,10 @@ fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, 
         };
 
         if opts.show_blocks || opts.l {
-            let name = entry_filename(&p, parent);
-            let is_hidden_dotfile = name.starts_with('.') && !name.starts_with("..") && name != ".";
+            let name_bytes = entry_filename_bytes(&p, parent);
+            let is_hidden_dotfile = name_bytes.starts_with(b".")
+                && !name_bytes.starts_with(b"..")
+                && name_bytes.as_slice() != b".";
             // Perl: if not -d and ($opts{a} or filename !~ /^\.[^.]+/)
             if !md.file_type().is_dir() && (opts.a || !is_hidden_dotfile) {
                 blocks_total += md.blocks();
@@ -580,7 +611,6 @@ fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, 
     let mut w_blocks = 0usize;
     let mut w_ino = 0usize;
     let mut w_bytes = 0usize;
-    let mut w_bytesh = 0usize;
     let mut w_owner = 0usize;
     let mut w_group = 0usize;
     let mut w_nlink = 0usize;
@@ -599,9 +629,6 @@ fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, 
         }
         if opts.l {
             w_bytes = w_bytes.max(e.md.len().to_string().len());
-            if opts.h {
-                w_bytesh = w_bytesh.max(format_human(e.md.len()).len());
-            }
             let owner = if opts.n {
                 e.md.uid().to_string()
             } else {
@@ -619,18 +646,13 @@ fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, 
         }
     }
 
-    if opts.show_blocks || opts.l {
-        if let Some(p) = parent {
-            if !opts.d {
-                let total = if opts.k {
-                    blocks_total / 2
-                } else {
-                    blocks_total
-                };
-                let _ = writeln!(out, "total {}", total);
-                let _ = p; // suppress unused warning if needed
-            }
-        }
+    if (opts.show_blocks || opts.l) && parent.is_some() && !opts.d {
+        let total = if opts.k {
+            blocks_total / 2
+        } else {
+            blocks_total
+        };
+        writeln!(out, "total {}", total)?;
     }
 
     for e in &entries {
@@ -638,67 +660,72 @@ fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, 
             || e.md.len() == 0
             || (opts.dimensions && e.dims.is_none() && !opts.unknown);
         if placeholder {
-            write_placeholder(out, opts);
+            write_placeholder(out, opts)?;
         } else {
-            write_image(out, &e.path, e.md.len(), opts);
+            write_image(out, &e.path, e.md.len(), opts)?;
         }
 
         if opts.dimensions && (w_dim_w > 0 || w_dim_h > 0) {
             let mw = w_dim_w.max(1);
             let mh = w_dim_h.max(1);
             if let Some((w, h)) = e.dims {
-                let _ = write!(out, " [{:>mw$} x {:>mh$}] ", w, h, mw = mw, mh = mh);
+                write!(out, " [{:>mw$} x {:>mh$}] ", w, h, mw = mw, mh = mh)?;
             } else {
-                let _ = write!(out, " {:>mw$}   {:>mh$}   ", "", "", mw = mw, mh = mh);
+                write!(out, " {:>mw$}   {:>mh$}   ", "", "", mw = mw, mh = mh)?;
             }
         }
 
         if opts.i {
-            let _ = write!(out, " {:>w$}", e.md.ino(), w = w_ino);
+            write!(out, " {:>w$}", e.md.ino(), w = w_ino)?;
         }
         if opts.s {
-            let _ = write!(out, " {:>w$}", e.md.blocks(), w = w_blocks);
+            write!(out, " {:>w$}", e.md.blocks(), w = w_blocks)?;
         }
         if opts.l {
-            let _ = write!(out, " {}", format_mode(e.md.mode()));
-            let _ = write!(out, " {:>w$}", e.md.nlink(), w = w_nlink);
+            write!(out, " {}", format_mode(e.md.mode()))?;
+            write!(out, " {:>w$}", e.md.nlink(), w = w_nlink)?;
             let owner = if opts.n {
                 e.md.uid().to_string()
             } else {
                 uid_name(e.md.uid()).unwrap_or_else(|| e.md.uid().to_string())
             };
-            let _ = write!(out, " {:>w$}", owner, w = w_owner);
+            write!(out, " {:>w$}", owner, w = w_owner)?;
             if !opts.o {
                 let group = if opts.n {
                     e.md.gid().to_string()
                 } else {
                     gid_name(e.md.gid()).unwrap_or_else(|| e.md.gid().to_string())
                 };
-                let _ = write!(out, "  {:>w$}", group, w = w_group);
+                write!(out, "  {:>w$}", group, w = w_group)?;
             }
             if opts.h {
-                let _ = write!(out, "  {:>4}", format_human(e.md.len()));
+                write!(out, "  {:>4}", format_human(e.md.len()))?;
             } else {
-                let _ = write!(out, "  {:>w$}", e.md.len(), w = w_bytes);
+                write!(out, "  {:>w$}", e.md.len(), w = w_bytes)?;
             }
             let t = if opts.c { e.md.ctime() } else { e.md.mtime() };
-            let _ = write!(out, " {}", format_time(t, opts));
+            write!(out, " {}", format_time(t, opts))?;
         }
 
-        let name = entry_filename(&e.path, parent);
-        let _ = write!(out, " {}", name);
+        let name = entry_filename_bytes(&e.path, parent);
+        out.write_all(b" ")?;
+        write_sanitized(out, &name)?;
         let suffix = get_f_type(&e.md, opts);
-        let _ = write!(out, "{}", suffix);
-        let _ = writeln!(out);
+        write!(out, "{}", suffix)?;
+        writeln!(out)?;
     }
-    let _ = w_bytesh;
+
+    // Bound the stat cache: clear at end of each directory listing.
+    STAT_CACHE.with(|c| c.borrow_mut().clear());
+
+    Ok(())
 }
 
-fn main() {
+fn run() -> io::Result<()> {
     let cli = Cli::parse();
     let (opts, mut paths) = Opts::from_cli(cli);
 
-    let stdout = std::io::stdout();
+    let stdout = io::stdout();
     let mut out = stdout.lock();
 
     let mut do_header = paths.len() > 1;
@@ -707,15 +734,15 @@ fn main() {
     }
 
     let mut files: Vec<PathBuf> = Vec::new();
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut dirs: VecDeque<PathBuf> = VecDeque::new();
     for p in paths {
         match lstat(&p) {
             None => {
-                let _ = writeln!(
-                    std::io::stderr(),
+                writeln!(
+                    io::stderr(),
                     "thmbs: {}: No such file or directory",
                     p.display()
-                );
+                )?;
             }
             Some(md) if md.file_type().is_file() || (opts.d && !md.file_type().is_dir()) => {
                 files.push(p);
@@ -724,7 +751,7 @@ fn main() {
                 if opts.d {
                     files.push(p);
                 } else {
-                    dirs.push(p);
+                    dirs.push_back(p);
                 }
             }
             Some(_) => files.push(p),
@@ -732,38 +759,54 @@ fn main() {
     }
 
     ls_sort(&mut files, &opts);
-    ls_sort(&mut dirs, &opts);
+    {
+        let mut tmp: Vec<PathBuf> = dirs.drain(..).collect();
+        ls_sort(&mut tmp, &opts);
+        dirs = VecDeque::from(tmp);
+    }
 
     if !files.is_empty() {
-        do_ls(&mut out, None, files, &opts);
+        do_ls(&mut out, None, files, &opts)?;
+    }
+
+    // Symlink-loop guard for -R: track visited (dev, ino).
+    let mut visited: HashSet<(u64, u64)> = HashSet::new();
+    // Seed visited with initially-listed dirs so we never re-enter them.
+    for d in &dirs {
+        if let Some(md) = lstat(d) {
+            visited.insert((md.dev(), md.ino()));
+        }
     }
 
     let mut do_newline = false;
-    while !dirs.is_empty() {
-        let path = dirs.remove(0);
+    while let Some(path) = dirs.pop_front() {
         let (f, d) = match read_dir_split(&path, &opts) {
             Ok(t) => t,
             Err(e) => {
-                let _ = writeln!(
-                    std::io::stderr(),
+                writeln!(
+                    io::stderr(),
                     "Unable to open directory {}: {}",
                     path.display(),
                     e
-                );
+                )?;
                 continue;
             }
         };
         if do_newline {
-            let _ = writeln!(out);
+            writeln!(out)?;
         }
         if do_header {
-            let _ = writeln!(out, "{}:", path.display());
+            write!(out, "")?;
+            // Sanitize the directory header path bytes.
+            let header = path.as_os_str().as_bytes();
+            write_sanitized(&mut out, header)?;
+            writeln!(out, ":")?;
         }
         do_header = true;
 
         let mut combined = f;
         combined.extend(d.iter().cloned());
-        do_ls(&mut out, Some(&path), combined, &opts);
+        do_ls(&mut out, Some(&path), combined, &opts)?;
 
         if opts.r_upper {
             for sub in d {
@@ -774,9 +817,30 @@ fn main() {
                 if name == "." || name == ".." {
                     continue;
                 }
-                dirs.push(sub);
+                if let Some(md) = lstat(&sub) {
+                    let key = (md.dev(), md.ino());
+                    if visited.insert(key) {
+                        dirs.push_back(sub);
+                    }
+                }
             }
         }
         do_newline = true;
+    }
+
+    out.flush()?;
+    Ok(())
+}
+
+fn main() {
+    match run() {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+            std::process::exit(0);
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "thmbs: {}", e);
+            std::process::exit(1);
+        }
     }
 }
