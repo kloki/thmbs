@@ -21,13 +21,13 @@
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::CStr,
     fs,
-    io::Write,
+    io::{self, ErrorKind, Read as _, Write},
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -38,6 +38,7 @@ use jiff::{Timestamp, Zoned, tz::TimeZone};
 
 const ONE_PIXEL_BLACK: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2NgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==";
 const SIX_MONTHS: i64 = (365 * 86400) / 2;
+const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,24 +70,24 @@ struct Cli {
     no_preserve_ratio: bool,
 
     /// Show image dimensions (WxH) next to each file
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "no_dimensions")]
     dimensions: bool,
     /// Hide image dimensions column
     #[arg(long = "no-dimensions", alias = "nodimensions",
-          default_value_t = false, action = clap::ArgAction::SetTrue)]
+          default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "dimensions")]
     no_dimensions: bool,
 
     /// Include files whose dimensions cannot be determined
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "no_unknown")]
     unknown: bool,
     /// Skip files whose dimensions cannot be determined
     #[arg(long = "no-unknown", alias = "nounknown",
-          default_value_t = false, action = clap::ArgAction::SetTrue)]
+          default_value_t = false, action = clap::ArgAction::SetTrue,
+          overrides_with = "unknown")]
     no_unknown: bool,
-
-    /// Reserved (currently unused)
-    #[arg(long)]
-    method: Option<String>,
 
     // ls options
     /// List all entries except . and ..
@@ -135,10 +136,12 @@ struct Cli {
     #[arg(short = 's', action = clap::ArgAction::SetTrue)]
     s: bool,
     /// Sort by modification time, newest first
-    #[arg(short = 't', action = clap::ArgAction::SetTrue)]
+    #[arg(short = 't', action = clap::ArgAction::SetTrue,
+          overrides_with = "s_upper")]
     t: bool,
     /// Sort by file size, largest first
-    #[arg(short = 'S', action = clap::ArgAction::SetTrue)]
+    #[arg(short = 'S', action = clap::ArgAction::SetTrue,
+          overrides_with = "t")]
     s_upper: bool,
     /// Sort by/use access time instead of modification time
     #[arg(short = 'u', action = clap::ArgAction::SetTrue)]
@@ -162,27 +165,11 @@ struct Cli {
 
 impl Cli {
     fn show_dimensions(&self) -> bool {
-        // dimensions/no_dimensions: --no-X wins if set; otherwise --X.
-        // Per Perl: each toggles 'unknown' too.
-        let mut dimensions = self.dimensions;
-        if self.no_dimensions {
-            dimensions = false;
-        }
-        if self.unknown || self.no_unknown {
-            dimensions = !self.no_unknown || self.dimensions;
-        }
-        dimensions
+        self.dimensions || self.unknown
     }
 
     fn show_unknown(&self) -> bool {
-        let mut unknown = self.unknown;
-        if self.no_unknown {
-            unknown = false;
-        }
-        if self.dimensions || self.no_dimensions {
-            unknown = !self.no_dimensions || self.unknown;
-        }
-        unknown
+        self.unknown
     }
 
     fn preserve_ratio_resolved(&self) -> bool {
@@ -198,10 +185,6 @@ impl Cli {
     }
 
     fn sort_s_upper(&self) -> bool {
-        // Perl: -t deletes -S; if both set, prefer -t.
-        if self.t && self.s_upper {
-            return false;
-        }
         self.s_upper
     }
 
@@ -249,12 +232,33 @@ fn lstat(path: &Path) -> Option<fs::Metadata> {
     })
 }
 
+fn read_image_capped(file: &Path, size: u64) -> io::Result<Vec<u8>> {
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)?;
+    let md = f.metadata()?;
+    if !md.file_type().is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if md.len() > MAX_IMAGE_BYTES {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "file too large"));
+    }
+    let cap = size.min(MAX_IMAGE_BYTES) as usize;
+    let mut buf = Vec::with_capacity(cap);
+    f.take(MAX_IMAGE_BYTES).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 fn write_image<W: Write>(out: &mut W, file: &Path, size: u64, cli: &Cli) {
     let display_name = file.as_os_str().as_bytes();
     let mut name_b64 = B64.encode(display_name);
     let mut size_str = size.to_string();
 
-    let encoded = match fs::read(file) {
+    let encoded = match read_image_capped(file, size) {
         Ok(bytes) if !bytes.is_empty() => B64.encode(&bytes),
         _ => {
             name_b64 = B64.encode(b"one_pixel_black");
@@ -339,7 +343,14 @@ fn ls_sort(paths: &mut [PathBuf], cli: &Cli) {
             }
         });
     } else if cli.ctime() {
-        paths.sort();
+        paths.sort_by(|a, b| {
+            let am = lstat(a).map_or(0, |m| m.ctime());
+            let bm = lstat(b).map_or(0, |m| m.ctime());
+            match bm.cmp(&am) {
+                Ordering::Equal => a.cmp(b),
+                o => o,
+            }
+        });
     } else if cli.u {
         paths.sort_by(|a, b| {
             let am = lstat(a).map_or(0, |m| m.atime());
@@ -494,6 +505,19 @@ fn entry_filename(path: &Path, parent: Option<&Path>) -> String {
     } else {
         path.to_string_lossy().into_owned()
     }
+}
+
+fn sanitize_for_tty(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let c = ch as u32;
+        if c < 0x20 || c == 0x7f {
+            out.push('?');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn dot_filtered(name: &str, cli: &Cli) -> bool {
@@ -668,7 +692,7 @@ fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, 
             let _ = write!(out, " {}", format_time(t, cli));
         }
 
-        let name = entry_filename(&e.path, parent);
+        let name = sanitize_for_tty(&entry_filename(&e.path, parent));
         let _ = write!(out, " {}", name);
         let suffix = get_f_type(&e.md, cli);
         let _ = write!(out, "{}", suffix);
@@ -677,6 +701,11 @@ fn do_ls<W: Write>(out: &mut W, parent: Option<&Path>, mut paths: Vec<PathBuf>, 
 }
 
 fn main() {
+    // Restore default SIGPIPE behavior so writing to a closed pipe terminates
+    // the process cleanly instead of triggering a Rust panic on stdout writes.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let mut paths = cli.paths.clone();
 
@@ -721,8 +750,15 @@ fn main() {
     }
 
     let mut do_newline = false;
-    while !dirs.is_empty() {
-        let path = dirs.remove(0);
+    let mut visited: HashSet<(u64, u64)> = HashSet::new();
+    let mut queue: VecDeque<PathBuf> = VecDeque::from(dirs);
+    while let Some(path) = queue.pop_front() {
+        if let Some(md) = lstat(&path) {
+            let key = (md.dev(), md.ino());
+            if !visited.insert(key) {
+                continue;
+            }
+        }
         let (f, d) = match read_dir_split(&path, &cli) {
             Ok(t) => t,
             Err(e) => {
@@ -739,7 +775,7 @@ fn main() {
             let _ = writeln!(out);
         }
         if do_header {
-            let _ = writeln!(out, "{}:", path.display());
+            let _ = writeln!(out, "{}:", sanitize_for_tty(&path.display().to_string()));
         }
         do_header = true;
 
@@ -756,7 +792,7 @@ fn main() {
                 if name == "." || name == ".." {
                     continue;
                 }
-                dirs.push(sub);
+                queue.push_back(sub);
             }
         }
         do_newline = true;
@@ -780,7 +816,6 @@ mod tests {
             no_dimensions: false,
             unknown: false,
             no_unknown: false,
-            method: None,
             a_upper: false,
             f_upper: false,
             r_upper: false,
