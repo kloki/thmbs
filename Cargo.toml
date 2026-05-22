@@ -1,6 +1,6 @@
 [package]
 name = "thmbs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "ls(1) listing supplemented with inline image thumbnails"
 license = "MIT"
